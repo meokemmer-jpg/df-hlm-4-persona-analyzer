@@ -1,0 +1,91 @@
+# DF-HLM-4 Persona-Cohort-Analyzer for HeyLou Marketing Wave 2
+df_id: DF-HLM-4
+df_name: heylou-persona-cohort-analyzer
+version: 0.1.0
+status: ACTIVE-MOCK-FIRST
+
+description: |
+  Statistical cohort analyzer for HeyLou Marketing Wave 2. Default-disabled
+  real PMS mode; mock mode produces deterministic synthetic booking cohorts.
+
+k11_cascade_containment:
+  failure_blast_radius: 0
+  dependency_dlq_separate: true
+  cascade_isolation: hard
+
+k12_distillation_resistenz:
+  provenance_required_in_output: true
+  non_llm_validation_layer: true
+  output_fields_required:
+    - cohort_size
+    - confidence_interval_95
+
+k13_independent_ground_truth:
+  external_anchor_type: hotel_pms_api
+  pre_action_domain_check: true
+
+k14_human_override_decay:
+  override_complexity: single_command
+  martin_review_cadence: monthly
+
+k15_entropy_budget:
+  entropy_added_loc_estimate: 380
+  entropy_justified_by_rho: "EUR 70-90k/Jahr Persona-Match-Optimierung"
+
+k16_concurrent_spawn_mutex:
+  lock_dir: /tmp/df-hlm-4.lock
+  engine_pgrep_check: true
+  lock_release_on: EXIT_INT_TERM
+
+lose_coupling:
+  LC1_graceful_degradation:
+    modes:
+      - full
+      - degraded_pms_api
+      - degraded_partial_cohorts
+      - standalone_cached_baseline
+  LC2_direct_mode_fallback:
+    capability: 0.70
+    trigger: "PMS-API unreachable >30s"
+  LC3_circuit_breaker:
+    timeout_s: 30
+    open_threshold: 3
+  LC4_failure_isolation:
+    state_externalization: true
+    idempotent: true
+  LC5_health_check_independence:
+    health_check_dependencies: []
+
+env_var_gating:
+  default_mode: mock
+  real_mode_required:
+    DF_HLM_4_REAL_PMS_ENABLED: "true"
+    PHRONESIS_TICKET_PATTERN: "^PT-2026-[A-Z0-9]{2}-[A-Z0-9]{3}$"
+    Q_0_APPROVAL: DANIELA-COHORT-ANONYMIZATION
+
+domain:
+  personas:
+    - Bayer-Werks
+    - Bosch-Travel
+    - Familie
+    - Buchmesse-Verleger
+    - KIT-Forscher
+    - Salzburg-Klassik
+    - Wedding
+    - Mittelalter
+  kmeans_k: 8
+  feature_vector:
+    - avg_stay_nights
+    - channel
+    - price_segment
+    - season_index
+    - group_size
+  min_cohort_size: 5
+
+operations:
+  output_path: ~/Projects/dark-factories/df-hlm-4-persona-analyzer/
+  report_dir: branch-hub/reports
+  audit_log_path: branch-hub/audit/df-hlm-4-audit.jsonl
+  state_dir: branch-hub/state
+  dlq_dir: branch-hub/dlq
+  health_file_path: /tmp/df-hlm-4-health.json
