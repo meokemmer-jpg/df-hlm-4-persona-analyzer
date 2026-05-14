@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,11 @@ from src.persona_analyzer import Booking, PersonaAnalyzer, PERSONAS  # noqa: E40
 @pytest.fixture
 def analyzer(tmp_path: Path) -> PersonaAnalyzer:
     return PersonaAnalyzer(root=tmp_path)
+
+
+@pytest.fixture
+def engine(analyzer: PersonaAnalyzer) -> PersonaAnalyzer:
+    return analyzer
 
 
 def test_default_mock_mode_synthetic_data(analyzer: PersonaAnalyzer) -> None:
@@ -142,3 +149,76 @@ def test_audit_log_appended_per_run(analyzer: PersonaAnalyzer) -> None:
     lines = Path(result.audit_path).read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) >= 2
     assert json.loads(lines[-1])["snapshot_id"] == result2.snapshot_id
+
+
+def test_pii_scrubbed_in_output_with_kemmer_name(engine: PersonaAnalyzer) -> None:
+    """Output enthaelt keinen Kemmer-Familien-Namen."""
+
+    original_markdown = engine._markdown
+
+    def markdown_with_pii(*args: object, **kwargs: object) -> str:
+        return f"{original_markdown(*args, **kwargs)}\nSensitive: Martin met Imke.\n"
+
+    engine._markdown = markdown_with_pii  # type: ignore[method-assign]
+    result = engine.run("2026-05")
+    text = Path(result.markdown_path).read_text(encoding="utf-8")
+    assert "Martin" not in text
+    assert "Imke" not in text
+
+
+def test_k13_pre_action_verification_env_tag_block(engine: PersonaAnalyzer, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real-Mode mit falschem env_tag wird geblockt."""
+
+    monkeypatch.setenv("DF_ENV_TAG", "prod")
+    monkeypatch.setenv("DF_HLM_4_REAL_PMS_ENABLED", "true")
+    with pytest.raises(RuntimeError) as exc_info:
+        engine.run("2026-05")
+    assert "K13" in str(exc_info.value)
+
+
+def test_mock_provenance_explicit_in_output(engine: PersonaAnalyzer) -> None:
+    """Mock-Outputs haben 'mode': 'mock' in Provenance."""
+
+    result = engine.run("2026-05")
+    text = Path(result.markdown_path).read_text(encoding="utf-8")
+    assert '"mode": "mock"' in text or "MOCK-" in text
+
+
+def test_k16_mutex_blocks_concurrent_spawn(tmp_path: Path) -> None:
+    """Concurrent Engine-Spawn wird geblockt."""
+
+    first = PersonaAnalyzer(root=tmp_path)
+    second = PersonaAnalyzer(root=tmp_path)
+    entered = threading.Event()
+    errors: list[Exception] = []
+    completed: list[str] = []
+    lock_dir = Path("/tmp/df-hlm-4.lock")
+    second.release_mutex(lock_dir)
+
+    original_synthetic = first.synthetic_bookings
+
+    def slow_synthetic(month: str, n_per_persona: int = 12) -> list[Booking]:
+        entered.set()
+        time.sleep(0.35)
+        return original_synthetic(month, n_per_persona=n_per_persona)
+
+    first.synthetic_bookings = slow_synthetic  # type: ignore[method-assign]
+
+    def run_engine(analyzer: PersonaAnalyzer) -> None:
+        try:
+            completed.append(analyzer.run("2026-05").mode)
+        except Exception as exc:  # pragma: no cover - assertion below inspects captured error
+            errors.append(exc)
+
+    thread_a = threading.Thread(target=run_engine, args=(first,))
+    thread_b = threading.Thread(target=run_engine, args=(second,))
+
+    thread_a.start()
+    assert entered.wait(timeout=2)
+    thread_b.start()
+    thread_a.join()
+    thread_b.join()
+
+    assert completed == ["mock"]
+    assert any("K16-VETO" in str(exc) for exc in errors)
+    second.release_mutex(lock_dir)

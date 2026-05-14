@@ -16,6 +16,19 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+COMMON_ROOT = str(Path(__file__).resolve().parents[2])
+if COMMON_ROOT not in sys.path:
+    sys.path.insert(0, COMMON_ROOT)
+
+from _df_common.pii_scrubber import PIIScrubber, scrub_audit_payload
+from _df_common.welle_b2_patches import (
+    K13PreActionVerifier,
+    K16MutexGuard,
+    MOCK_PREFIX,
+    make_mock_url,
+    make_provenance_envelope,
+)
+
 try:
     import numpy as np  # type: ignore
 except Exception:  # pragma: no cover - exercised in minimal local envs
@@ -134,6 +147,8 @@ class PersonaAnalyzer:
             open_threshold=self.config["lose_coupling"]["LC3_circuit_breaker"]["open_threshold"],
             timeout_s=self.config["lose_coupling"]["LC3_circuit_breaker"]["timeout_s"],
         )
+        self.pii_scrubber = PIIScrubber(enabled=True, kemmer_names_enabled=True)
+        self._mutex_guards: dict[Path, K16MutexGuard] = {}
     @staticmethod
     def default_config() -> dict[str, Any]:
         return {
@@ -169,36 +184,61 @@ class PersonaAnalyzer:
     def health_check(self) -> dict[str, Any]:
         return {"healthy": True, "dependencies": [], "df_id": "DF-HLM-4"}
 
+    def _real_dispatch_requested(self) -> bool:
+        return any(
+            value.lower() == "true"
+            for key, value in os.environ.items()
+            if key.startswith("DF_HLM_4_REAL_") and key.endswith("_ENABLED")
+        )
+
+    def _verify_real_dispatch(self) -> None:
+        verifier = K13PreActionVerifier(
+            expected_env_tag="dev",
+            expected_mount_pattern="/Users/make",
+            blast_radius_class="state-only",
+        )
+        result = verifier.verify()
+        if not result.ok:
+            raise RuntimeError(f"K13-VETO: {result.failed_check}")
+
     def acquire_mutex(self, lock_dir: Path | None = None) -> bool:
         target = lock_dir or Path(self.config["k16_concurrent_spawn_mutex"]["lock_dir"])
-        try:
-            target.mkdir(parents=True, exist_ok=False)
-            (target / "pid").write_text(str(os.getpid()), encoding="utf-8")
-            return True
-        except FileExistsError:
-            return False
+        guard = K16MutexGuard(lock_dir=target, df_engine_marker="persona_analyzer.py")
+        result = guard.acquire()
+        if result.acquired:
+            self._mutex_guards[target] = guard
+        return result.acquired
 
     def release_mutex(self, lock_dir: Path | None = None) -> None:
         target = lock_dir or Path(self.config["k16_concurrent_spawn_mutex"]["lock_dir"])
+        guard = self._mutex_guards.pop(target, None)
+        if guard is not None:
+            guard.release()
+            return
         for child in target.glob("*") if target.exists() else []:
             child.unlink(missing_ok=True)
-        target.rmdir() if target.exists() else None
+        if target.exists():
+            target.rmdir()
 
     def run(self, month: str | None = None, pms_fetcher: Callable[[], list[Booking]] | None = None) -> AnalysisResult:
         if not self.pre_action_domain_check():
             raise RuntimeError("K13 pre_action_domain_check failed")
         month = month or date.today().strftime("%Y-%m")
-        mode = "real_pms" if self.real_mode_enabled() else "mock"
-        try:
-            bookings = self.breaker.call(pms_fetcher) if mode == "real_pms" and pms_fetcher else self.synthetic_bookings(month)
-        except Exception as exc:
-            self._append_dlq(month, exc)
-            mode = "standalone_cached_baseline"
-            bookings = self.cached_baseline(month)
-        result = self.analyze(bookings, month, mode)
-        self._append_audit({"event": "run_completed", "month": month, "mode": mode, "snapshot_id": result.snapshot_id})
-        LOG.info("df_hlm_4_run_completed", month=month, mode=mode)
-        return result
+        with K16MutexGuard(lock_dir="/tmp/df-hlm-4.lock", df_engine_marker="persona_analyzer.py"):
+            if self._real_dispatch_requested():
+                self._verify_real_dispatch()
+            mode = "real_pms" if self.real_mode_enabled() else "mock"
+            try:
+                bookings = self.breaker.call(pms_fetcher) if mode == "real_pms" and pms_fetcher else self.synthetic_bookings(month)
+            except Exception as exc:
+                self._append_dlq(month, exc)
+                mode = "standalone_cached_baseline"
+                bookings = self.cached_baseline(month)
+            result = self.analyze(bookings, month, mode)
+            event_name = "mock_run_complete" if result.mode == "mock" else "run_complete"
+            self._append_audit({"event": event_name, "month": month, "mode": mode, "snapshot_id": result.snapshot_id})
+            LOG.info("df_hlm_4_run_completed", month=month, mode=mode)
+            return result
 
     def analyze(self, bookings: list[Booking], month: str, mode: str = "mock") -> AnalysisResult:
         features = [self.feature_vector(b) for b in bookings]
@@ -344,14 +384,55 @@ class PersonaAnalyzer:
         md_path = self.report_dir / f"df-hlm-4-monthly-cohort-report-{month}.md"
         csv_path = self.report_dir / f"df-hlm-4-monthly-cohort-report-{month}.csv"
         alert_path = self.report_dir / f"df-hlm-4-persona-drift-alert-{month}.json"
-        md = self._markdown(month, mode, cohorts, chi, ttest, drift, snapshot_id)
+        timestamp_iso = datetime.now(timezone.utc).isoformat()
+        provenance = self._build_provenance(mode, snapshot_id, timestamp_iso)
+        md = self._markdown(month, mode, cohorts, chi, ttest, drift, snapshot_id, provenance)
         self._atomic_write(md_path, md)
         self._atomic_write_csv(csv_path, cohorts)
-        self._atomic_write(alert_path, json.dumps(drift, indent=2, sort_keys=True))
+        self._atomic_write_json(alert_path, {"provenance": provenance, "drift": drift})
         return str(md_path), str(csv_path), str(alert_path), str(self.audit_log_path)
 
-    def _markdown(self, month: str, mode: str, cohorts: list[CohortStat], chi: dict[str, float], ttest: dict[str, float | str], drift: dict[str, Any], snapshot_id: str) -> str:
-        lines = [f"# DF-HLM-4 Monthly Cohort Report {month}", "", f"- Mode: {mode}", f"- Snapshot: {snapshot_id}", "- Provenance: cohort_size and confidence_interval_95 included; non-LLM deterministic statistics.", ""]
+    def _build_provenance(self, mode: str, snapshot_id: str, timestamp_iso: str) -> dict[str, Any]:
+        is_mock = mode == "mock"
+        provenance = make_provenance_envelope(
+            df_id="DF-HLM-4",
+            timestamp_iso=timestamp_iso,
+            is_mock=is_mock,
+            activation_gate_id=None if is_mock else os.environ.get("PHRONESIS_TICKET"),
+            source_hash=snapshot_id,
+        )
+        provenance["artifact_url"] = (
+            make_mock_url("https://heylou.local/df-hlm-4/personas", snapshot_id)
+            if is_mock
+            else f"https://heylou.local/df-hlm-4/personas/{snapshot_id}"
+        )
+        provenance["mock_prefix"] = MOCK_PREFIX if is_mock else ""
+        return provenance
+
+    def _markdown(
+        self,
+        month: str,
+        mode: str,
+        cohorts: list[CohortStat],
+        chi: dict[str, float],
+        ttest: dict[str, float | str],
+        drift: dict[str, Any],
+        snapshot_id: str,
+        provenance: dict[str, Any],
+    ) -> str:
+        lines = [
+            f"# DF-HLM-4 Monthly Cohort Report {month}",
+            "",
+            f"- Mode: {mode}",
+            f"- Snapshot: {snapshot_id}",
+            "- Provenance: cohort_size and confidence_interval_95 included; non-LLM deterministic statistics.",
+            "",
+            "## Provenance",
+            "```json",
+            json.dumps(provenance, indent=2, sort_keys=True),
+            "```",
+            "",
+        ]
         lines.append("| Persona | Cohort-Size | Avg Revenue | CI95 | Retention | Referral | NPS |")
         lines.append("|---|---:|---:|---|---:|---:|---:|")
         for c in cohorts:
@@ -361,30 +442,39 @@ class PersonaAnalyzer:
 
     def _atomic_write_csv(self, path: Path, cohorts: list[CohortStat]) -> None:
         tmp = path.with_suffix(path.suffix + ".tmp")
+        rows = [self.pii_scrubber.scrub_dict_recursive(asdict(c)) for c in cohorts]
         with tmp.open("w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=list(asdict(cohorts[0]).keys()) if cohorts else ["persona"])
+            writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()) if rows else ["persona"])
             writer.writeheader()
-            for c in cohorts:
-                writer.writerow(asdict(c))
+            for row in rows:
+                writer.writerow(row)
         os.replace(tmp, path)
 
-    @staticmethod
-    def _atomic_write(path: Path, content: str) -> None:
+    def _atomic_write(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(content, encoding="utf-8")
+        text_scrubbed = self.pii_scrubber.scrub(content)
+        tmp.write_text(text_scrubbed, encoding="utf-8")
         os.replace(tmp, path)
+
+    def _atomic_write_json(self, path: Path, payload: dict[str, Any]) -> None:
+        data_scrubbed = self.pii_scrubber.scrub_dict_recursive(payload)
+        self._atomic_write(path, json.dumps(data_scrubbed, indent=2, sort_keys=True))
 
     def _append_audit(self, detail: dict[str, Any]) -> None:
         self.audit_log_path.parent.mkdir(parents=True, exist_ok=True)
         entry = {"ts_iso": datetime.now(timezone.utc).isoformat(), "df_id": "DF-HLM-4", **detail}
+        entry_scrubbed = scrub_audit_payload(entry)
         with self.audit_log_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, sort_keys=True) + "\n")
+            fh.write(json.dumps(entry_scrubbed, sort_keys=True) + "\n")
 
     def _append_dlq(self, month: str, exc: Exception) -> None:
         self.dlq_dir.mkdir(parents=True, exist_ok=True)
+        entry_scrubbed = self.pii_scrubber.scrub_dict_recursive(
+            {"month": month, "error": str(exc), "ts_iso": datetime.now(timezone.utc).isoformat()}
+        )
         with (self.dlq_dir / "pms_api.jsonl").open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"month": month, "error": str(exc), "ts_iso": datetime.now(timezone.utc).isoformat()}) + "\n")
+            fh.write(json.dumps(entry_scrubbed, sort_keys=True) + "\n")
 
 
 def main(argv: list[str] | None = None) -> int:
