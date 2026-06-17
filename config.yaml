@@ -89,3 +89,4 @@ operations:
   state_dir: branch-hub/state
   dlq_dir: branch-hub/dlq
   health_file_path: /tmp/df-hlm-4-health.json
+crux-mk: true
