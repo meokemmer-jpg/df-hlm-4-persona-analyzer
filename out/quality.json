@@ -1,9 +1,9 @@
 {
   "df": "df-hlm-4-persona-analyzer",
-  "ts": "2026-07-19T15:56:39.425296+00:00",
+  "ts": "2026-07-20T03:55:35.131319+00:00",
   "maturity": "TESTED",
   "maturity_level": 4,
   "evidence_grade": 4,
-  "wargame_verdict": null,
+  "wargame_verdict": "CONDITIONAL",
   "crux": "[CRUX-MK]"
 }
